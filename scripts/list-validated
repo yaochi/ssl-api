@@ -1,0 +1,12 @@
+#!/bin/bash
+set -u
+set -e
+
+trap 'echo "ERROR: Abnormal exit." >&2' ERR
+
+. "$STARTSSL_CLI_ROOT/config"
+. "$STARTSSL_CLI_ROOT/scripts/helper.inc"
+
+cli tokenID="$CFG_TOKEN_ID" actionType=QueryValidatedDomains 
+
+echo "${_CLI_RET['data']}"

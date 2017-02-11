@@ -1,0 +1,3 @@
+PEM_CERT_FILE=test-cert.pem
+CFG_TOKEN_ID=tk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx # get it from the StartSSL -> StartAPI site
+CFG_API_ENDPOINT=test # change to "production" when our scripts are ready

@@ -1,0 +1,215 @@
+#!/usr/bin/python3
+
+import json
+from pprint import pprint, pformat
+import os
+import sys
+import re
+from subprocess import Popen, PIPE
+import argparse
+import collections
+
+def add_input_param_jsonpath(key_arr, value, storage):
+	current_key = key_arr.pop(0) # pop() the first element
+	if len(key_arr) > 0:
+		if current_key not in storage:
+			storage[current_key] = {}
+		storage[current_key] = add_input_param_jsonpath(key_arr, value, storage[current_key])
+		return storage
+	else:
+		storage[current_key] = value
+		return storage
+
+def parse_argv_positional_only(args):
+	storage = {}
+	parse = re.compile('^([^=]+)=(.+)', re.DOTALL)
+	for arg in args:
+		m = parse.match(arg)
+		if m is None:
+			usage('bad command-line argument: {}'.format(arg))
+		key = m.group(1)
+		value = m.group(2)
+		storage = add_input_param_jsonpath(key.split('.'), value, storage)
+	return storage
+
+# http://stackoverflow.com/a/4042861/198219
+class ArgumentParserIM(argparse.ArgumentParser):
+	def error(self, message):
+		sys.stderr.write('error: {}\n'.format(message))
+		self.print_help(sys.stderr)
+		sys.exit(4) # bad command-line arguments
+
+def get_argv_parser():
+	parser = ArgumentParserIM(
+		description='Send an API request to StartSSL.',
+		epilog='API docs at https://startssl.com/StartAPI/Docs',
+		add_help = False
+	)
+	parser.add_argument('--certFile', required=True,
+		help='the StartAPI authentication file (in PEM format without a password)')
+	parser.add_argument('--apiEndpoint', required=True, choices=['test', 'production'],
+		help='specify to which API endpoint to send the request')
+	parser.add_argument('--output', required=False, choices=['json', 'jsonpath', 'jsonpath-null'],
+		default='jsonpath',
+		help='specify how the API output is printed; '
+			'"json" prints a standard JSON string; '
+			'"jsonpath" converts the JSON to a JSONPath notation; '
+			'"jsonpath-null" is the same as "jsonpath" but lines are '
+			'terminated with a zero byte (the ASCII NUL character) which is '
+			'useful for additional processing in shell scripts')
+	parser.add_argument('--ignore-api-status', required=False, action='store_true',
+		help='do not terminate with an error if the returned API status is non-OK')
+	parser.add_argument('--debug', required=False, action='store_true',
+		help='print debug information')
+	parser.add_argument('--help', required=False, action='store_true',
+		help='show this help message and exit')
+	parser.add_argument('API_PARAMS', nargs='+',
+		metavar='PARAM=VALUE',
+		help='the API command parameters to send')
+	
+	return parser
+
+def usage(err):
+	if err is not None:
+		print('error: ' + str(err) + '\n', file=sys.stderr)
+	get_argv_parser().print_help(sys.stderr)
+	sys.exit(4) # bad command-line arguments
+
+def parse_argv():
+	parser = get_argv_parser()
+	all_args = vars(parser.parse_args()) # http://stackoverflow.com/a/16878364/198219
+	if all_args['help']:
+		usage(None)
+
+	input_params = parse_argv_positional_only(all_args['API_PARAMS'])
+
+	all_args.pop('API_PARAMS')
+	settings = all_args
+	all_args = None # delete this variable
+
+	if settings['debug']:
+		print('Parsed settings: {}'.format(pformat(settings)), file=sys.stderr)
+		print('API parameters: {}'.format(pformat(input_params)), file=sys.stderr)
+	
+	if len(input_params) == 0:
+		usage('no API parameters provided')
+	
+	if settings['apiEndpoint'] == 'test':
+		settings['apiEndpoint'] = 'https://apitest.startssl.com'
+	elif settings['apiEndpoint'] == 'production':
+		settings['apiEndpoint'] = 'https://api.startssl.com'
+	else:
+		raise ValueError('Unknown apiEndpoint enum')
+
+	return (settings, input_params)
+
+def dump_curl(rc, out, err):
+	# dump the cURL return data
+	print('cURL exit code: {}'.format(rc), file=sys.stderr)
+	for desc, var in (('STDOUT', out), ('STDERR', err)):
+		print('cURL {} begin>'.format(desc), file=sys.stderr)
+		sys.stderr.buffer.write(var) # http://stackoverflow.com/a/16748830/198219
+		print('cURL {} end>'.format(desc), file=sys.stderr)
+
+def make_http_request(settings, http_request_data):
+	curl_cmd = [
+		'curl',
+		'--max-time', '30', # timeout for the whole API request/response
+		'-s', '-S', # show only errors, no progress
+		'-X', 'POST',
+		'--data-urlencode', http_request_data,
+		'--data-urlencode', 'btnSubmit=submit', # as per the API examples
+		'--cert', settings['certFile'],
+		settings['apiEndpoint']
+	]
+	if settings['debug']:
+		curl_cmd.extend(['--trace-time', '--verbose'])
+		#curl_cmd.extend(['--trace-time', '--trace-ascii', '/dev/stderr']) # http://superuser.com/a/291456/178604
+
+	if settings['debug']:
+		print('Executing cURL: {}'.format(pformat(curl_cmd)), file=sys.stderr)
+		
+	child = Popen(curl_cmd, stdin=None, stdout=PIPE, stderr=PIPE)
+	out, err = child.communicate()
+	rc = child.returncode
+
+	if rc != 0:
+		print('cURL failed!\n', file=sys.stderr)
+	if rc != 0 or settings['debug']:
+		dump_curl(rc, out, err)
+	if rc != 0:
+		sys.exit(2) # cURL failed
+	
+	if len(err) > 0 and not settings['debug']:
+		print('cURL exit code is zero but still we have STDERR output!\n', file=sys.stderr)
+		dump_curl(rc, out, err)
+		sys.exit(2) # cURL failed
+	
+	return out
+
+def json_decode_http_response(settings, http_out_raw):
+	http_out_raw = http_out_raw.decode(sys.stdout.encoding) # http://stackoverflow.com/a/6396717/198219
+	
+	try:
+		http_out_json = json.loads(http_out_raw)
+	except Exception as ex: # catch *all* exceptions # https://wiki.python.org/moin/HandlingExceptions
+		print('Unable to parse the returned data from the StartSSL API:', file=sys.stderr)
+		print('Exception: {}'.format(str(ex)), file=sys.stderr)
+		print('StartSSL API returned: {}'.format(http_out_raw), file=sys.stderr)
+		sys.exit(3) # bad API response text
+
+	if settings['debug']:
+		print('Parsed API response:\n{}'.format(pformat(http_out_json)), file=sys.stderr)
+	
+	return http_out_json
+
+def check_api_response_is_OK(settings, data):
+	if settings['ignore_api_status']:
+		return True
+
+	for key, exp_value in ( ('status', 1), ('errorCode', 0), ('shortMsg', 'success') ):
+		if data[key] != exp_value:
+			print('API returned a bad "{}"; expected "{}" but got "{}"'.format(
+				key, exp_value, data[key]
+				), file=sys.stderr)
+			return False
+	return True
+
+# http://stackoverflow.com/a/6027615/198219
+def flatten(d, parent_key='', sep='_'):
+	items = []
+	for k, v in d.items():
+		new_key = parent_key + sep + k if parent_key else k
+		if isinstance(v, collections.MutableMapping):
+			items.extend(flatten(v, new_key, sep=sep).items())
+		else:
+			items.append((new_key, v))
+	return dict(items)
+
+def print_api_response(settings, data):
+	if settings['output'] == 'jsonpath' or settings['output'] == 'jsonpath-null':
+		flat_data = flatten(data, '', '.')
+
+		if settings['output'] == 'jsonpath':
+			line_end = '\n'
+		else:
+			line_end = '\0'
+
+		for k, v in sorted(flat_data.items()):
+			sys.stdout.write('{}: {}{}'.format(k, v, line_end))
+	else:
+		print(json.dumps(data, sort_keys=True, indent=4))
+
+def main():
+	settings, input_params = parse_argv()
+
+	http_request_data = 'RequestData={}'.format(json.dumps(input_params))
+	http_out_raw = make_http_request(settings, http_request_data)
+	http_out_json = json_decode_http_response(settings, http_out_raw)
+
+	ok_response = check_api_response_is_OK(settings, http_out_json)
+	print_api_response(settings, http_out_json)
+	if not ok_response:
+		sys.exit(5) # bad API status code
+
+main()
