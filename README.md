@@ -1,3 +1,7 @@
+#
+
+_StartSSL's certificates are no longer trusted by Chrome, Firefox, and soon other browsers, beginning with newly issued certificates first. https://ma.ttias.be/despite-revoked-cas-startcom-wosign-continue-sell-certificates/_
+
 # startssl-api
 Universal Command Line Interface for the [StartSSL API](https://www.startssl.com/StartAPI)
 
